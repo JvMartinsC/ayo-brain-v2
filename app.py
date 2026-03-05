@@ -2,86 +2,78 @@ import os
 import json
 import requests
 from flask import Flask, request, jsonify
-import google.generativeai as genai
-import gspread
-from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
 # --- CONFIGURAÇÕES ---
-# 1. Gemini - FORÇANDO VERSÃO ESTÁVEL V1
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-
-# O segredo está aqui: transport='rest' evita bugs de versão em alguns servidores
-genai.configure(api_key=GEMINI_KEY, transport='rest')
-
-# Forçamos o modelo flash sem o prefixo 'models/' para evitar erro de busca
-model = genai.GenerativeModel('gemini-1.5-flash')
-
-# 2. Evolution API
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 EVO_URL = os.environ.get("EVO_URL", "").rstrip('/')
 EVO_KEY = os.environ.get("EVO_KEY")
 
-# 3. Google Sheets
-SHEET_ID = os.environ.get("SPREADSHEET_ID")
-try:
-    creds_json = json.loads(os.environ.get("GOOGLE_CREDS"))
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(creds_json, scopes=scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(SHEET_ID)
+# --- FUNÇÃO PARA FALAR COM O GEMINI SEM BIBLIOTECA ---
+def perguntar_ao_gemini(texto_usuario):
+    # Usamos a URL direta da API estável v1
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    headers = {'Content-Type': 'application/json'}
+    
+    prompt_completo = (
+        "Você é Ayo, a assistente da psicóloga Aline Machado. Sua voz é acolhedora, "
+        "poética e focada em ancestralidade. Nunca use termos médicos frios. "
+        f"O paciente disse: {texto_usuario}. Responda de forma breve, gentil e preta."
+    )
+    
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt_completo}]
+        }]
+    }
+    
     try:
-        anamnese_tab = sheet.worksheet("Anamneses")
-        estado_tab = sheet.worksheet("Estado_Conversa")
-    except:
-        print("Aviso: Abas da planilha não encontradas. O bot seguirá sem salvar dados.")
-except Exception as e:
-    print(f"Erro ao conectar na Planilha: {e}")
+        response = requests.post(url, headers=headers, json=payload)
+        response_data = response.json()
+        
+        # Se der erro 404 aqui, saberemos exatamente o porquê nos logs
+        if response.status_code != 200:
+            print(f"Erro na API do Google: {response_data}")
+            return "Desculpe, estou processando algumas informações. Pode repetir?"
+            
+        return response_data['candidates'][0]['content']['parts'][0]['text']
+    except Exception as e:
+        print(f"Erro ao chamar Gemini: {e}")
+        return "Tive um pequeno tropeço nos pensamentos. Como posso ajudar?"
 
 # --- LÓGICA DO WEBHOOK ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
     
-    # 1. Segurança: Ignora mensagens do próprio bot
+    # Ignora mensagens enviadas pelo bot
     if data.get('data', {}).get('key', {}).get('fromMe', False):
         return jsonify({"status": "ignored_self"}), 200
 
-    # 2. Verifica se há mensagem
     if 'data' in data and 'message' in data['data']:
         try:
             remote_jid = data['data']['key']['remoteJid']
-            message_body = ""
             msg_content = data['data']['message']
             
-            # Extração de texto (simples ou estendido)
-            if 'conversation' in msg_content:
-                message_body = msg_content['conversation']
-            elif 'extendedTextMessage' in msg_content:
-                message_body = msg_content['extendedTextMessage']['text']
+            # Pega o texto da mensagem
+            message_body = msg_content.get('conversation') or \
+                           msg_content.get('extendedTextMessage', {}).get('text')
             
             if not message_body:
-                return jsonify({"status": "no_text_content"}), 200
+                return jsonify({"status": "no_text"}), 200
 
-            # 3. Prompt da Ayo
-            prompt = (
-                "Você é Ayo, a assistente da psicóloga Aline Machado. Sua voz é acolhedora, "
-                "poética e focada em ancestralidade. Nunca use termos médicos frios. "
-                "O objetivo é fazer uma anamnese fluida. Pergunte sobre o nome, história e motivação. "
-                f"O paciente disse: {message_body}. Responda de forma breve, gentil e preta."
-            )
-            
-            # 4. Chamada ao Gemini (v1)
-            response = model.generate_content(prompt)
-            texto_resposta = response.text
+            # Chama o Gemini
+            resposta_ayo = perguntar_ao_gemini(message_body)
 
-            # 5. Envio para Evolution API
+            # Envia para a Evolution API
             send_url = f"{EVO_URL}/message/sendText/Ayo-Bot"
             headers = {"apikey": EVO_KEY, "Content-Type": "application/json"}
             
             payload = {
                 "number": remote_jid.split('@')[0],
-                "text": texto_resposta,
+                "text": resposta_ayo,
                 "delay": 1200
             }
             
@@ -89,13 +81,11 @@ def webhook():
             return jsonify({"status": "success"}), 200
 
         except Exception as e:
-            # Se o erro for o 404 de modelo, ele aparecerá aqui no log
-            print(f"Erro no processamento: {e}")
-            return jsonify({"status": "error", "details": str(e)}), 500
+            print(f"Erro Geral: {e}")
+            return jsonify({"status": "error"}), 500
 
     return jsonify({"status": "ignored"}), 200
 
 if __name__ == "__main__":
-    # O Railway usa a porta 8080 por padrão
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
